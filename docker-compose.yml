@@ -1,0 +1,71 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ridenear
+      POSTGRES_PASSWORD: ridenear
+      POSTGRES_DB: ridenear
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ridenear -d ridenear']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql://ridenear:ridenear@postgres:5432/ridenear
+      JWT_SECRET: local-dev-jwt-secret-change-me
+      AI_SERVICE_URL: http://ai:8000
+      AI_SERVICE_TOKEN: local-dev-ai-service-token
+      LLM_BASE_URL: https://api.openai.com/v1
+      LLM_API_KEY: ''
+      LLM_MODEL: gpt-4o-mini
+      CORS_ORIGIN: http://localhost:5173
+      GPS_TICK_MS: '2000'
+      PORT: '3000'
+    ports:
+      - '3000:3000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ai:
+        condition: service_started
+
+  web:
+    build:
+      context: ../ridenear-web
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: http://localhost:3000
+        VITE_WS_URL: http://localhost:3000
+    ports:
+      - '5173:80'
+    depends_on:
+      - api
+
+  ai:
+    build:
+      context: ../ridenear-ai
+      dockerfile: Dockerfile
+    environment:
+      CHROMA_PATH: /data/chroma
+      AI_SERVICE_TOKEN: local-dev-ai-service-token
+      LLM_BASE_URL: https://api.openai.com/v1
+      LLM_API_KEY: ''
+      LLM_MODEL: gpt-4o-mini
+      RAG_MIN_SCORE: '0.35'
+    ports:
+      - '8000:8000'
+    volumes:
+      - chroma_data:/data/chroma
+
+volumes:
+  postgres_data:
+  chroma_data:
