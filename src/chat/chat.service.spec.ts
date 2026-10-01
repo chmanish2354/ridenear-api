@@ -607,6 +607,45 @@ describe('ChatService', () => {
     );
   });
 
+  it('looks up fuel and late return separately when no model key is set', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body)) as { query: string };
+        const document = body.query.includes('fuel') ? 'Fuel policy' : 'Late return';
+        const answer = body.query.includes('fuel')
+          ? 'Vehicles are handed over with a full tank.'
+          : 'The late fee is one extra rental day.';
+        return {
+          ok: true,
+          json: async () => ({
+            grounded: true,
+            answer,
+            citations: [{ document, chunkId: document, score: 0.8 }],
+          }),
+        };
+      }),
+    );
+
+    const result = await new ChatService(
+      {} as unknown as VehiclesService,
+      configWithoutKey(),
+    ).turn(
+      turn('What is your fuel policy and what happens if I return it late?'),
+    );
+
+    expect(result.toolTrace.map((entry) => entry.arguments.query)).toEqual([
+      'What is the fuel policy?',
+      'What happens if I return the vehicle late?',
+    ]);
+    expect(result.reply).toContain('full tank');
+    expect(result.reply).toContain('one extra rental day');
+    expect(result.citations.map((item) => item.document)).toEqual([
+      'Fuel policy',
+      'Late return',
+    ]);
+  });
+
   it('stops after five tool rounds and answers without tools', async () => {
     const search = vi.fn().mockResolvedValue([row({ id: 'V1' })]);
     let llmCalls = 0;

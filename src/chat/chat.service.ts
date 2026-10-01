@@ -858,9 +858,9 @@ export class ChatService {
       }
       if (outcome.policy) {
         if (outcome.policy.grounded) {
-          policyReply = outcome.policy.answer;
-          citations = outcome.policy.citations;
-        } else {
+          policyReply = joinPolicyText(policyReply, outcome.policy.answer);
+          citations = mergeCitations(citations, outcome.policy.citations);
+        } else if (policyReply === null) {
           policyReply = GUIDE_DOES_NOT_COVER;
           citations = [];
         }
@@ -1280,7 +1280,10 @@ function planRuleSteps(message: string, context: ChatContextDto): RuleStep[] {
   const idArgs = vehicleId ? { vehicleId } : {};
 
   if (isPolicyQuestion(text)) {
-    return [{ name: 'search_rental_policy', arguments: { query: text } }];
+    return policyQueries(text).map((query) => ({
+      name: 'search_rental_policy',
+      arguments: { query },
+    }));
   }
   if (/\breserve\b|\bbook\b/i.test(text)) {
     return [{ name: 'create_reservation', arguments: { ...idArgs, ...dates } }];
@@ -1310,6 +1313,55 @@ function isPolicyQuestion(text: string): boolean {
   return /\bfuel\b|\blate\b|\bcancel|\binsurance\b|\bpolicy\b|\bsecurity deposit\b|\brental guide\b/i.test(
     text,
   );
+}
+
+function policyQueries(text: string): string[] {
+  const queries: string[] = [];
+  if (/\bfuel\b/i.test(text)) {
+    queries.push('What is the fuel policy?');
+  }
+  if (/\blate\b/i.test(text)) {
+    queries.push('What happens if I return the vehicle late?');
+  }
+  if (/\bcancel/i.test(text)) {
+    queries.push('What is the cancellation policy?');
+  }
+  if (/\binsurance\b/i.test(text)) {
+    queries.push('What is the insurance policy?');
+  }
+  if (/\bsecurity deposit\b/i.test(text)) {
+    queries.push('What is the security deposit policy?');
+  }
+  return queries.length > 0 ? queries : [text];
+}
+
+function joinPolicyText(current: string | null, next: string): string {
+  const parts = `${current ?? ''}\n\n${next}`
+    .split(/\n\n+/)
+    .map((part) => part.trim())
+    .filter((part) => part !== '');
+  const unique: string[] = [];
+  for (const part of parts) {
+    if (!unique.includes(part)) {
+      unique.push(part);
+    }
+  }
+  return unique.join('\n\n');
+}
+
+function mergeCitations(
+  current: PolicyCitation[],
+  next: PolicyCitation[],
+): PolicyCitation[] {
+  const merged = [...current];
+  const seen = new Set(current.map((item) => item.chunkId));
+  for (const item of next) {
+    if (!seen.has(item.chunkId)) {
+      merged.push(item);
+      seen.add(item.chunkId);
+    }
+  }
+  return merged;
 }
 
 function isVehicleSearch(text: string): boolean {
