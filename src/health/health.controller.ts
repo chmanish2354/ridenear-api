@@ -1,13 +1,14 @@
 import { Controller, Get } from '@nestjs/common';
-import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
+import { ApiTags } from '@nestjs/swagger';
+import { Public } from '../auth/public.decorator.js';
 import { HealthService } from './health.service.js';
 
 @ApiTags('health')
-@ApiBearerAuth()
 @Controller('health')
 export class HealthController {
   constructor(private readonly healthService: HealthService) {}
 
+  @Public()
   @Get()
   getHealth() {
     return this.healthService.check();
