@@ -214,6 +214,8 @@ export class LlmUnavailableException extends HttpException {
   }
 }
 
+class LlmKeyRejectedException extends Error {}
+
 const unconfiguredReservations = {
   create: async () => {
     throw new Error('ReservationsService is not configured');
@@ -229,6 +231,22 @@ export class ChatService {
   ) {}
 
   async turn(dto: ChatTurnDto, userId: string): Promise<ChatTurnResult> {
+    const apiKey = this.config.get<string>('LLM_API_KEY')?.trim();
+    const baseUrl = this.config.get<string>('LLM_BASE_URL')?.trim();
+    if (!apiKey || !baseUrl) {
+      return this.ruleTurn(dto, userId);
+    }
+    try {
+      return await this.modelTurn(dto, userId);
+    } catch (error) {
+      if (error instanceof LlmKeyRejectedException) {
+        return this.ruleTurn(dto, userId);
+      }
+      throw error;
+    }
+  }
+
+  private async modelTurn(dto: ChatTurnDto, userId: string): Promise<ChatTurnResult> {
     const deadline = Date.now() + CHAT_BUDGET_MS;
     const messages: LlmMessage[] = [
       { role: 'system', content: systemPrompt(dto.context) },
@@ -245,6 +263,7 @@ export class ChatService {
     let policyReply: string | null = null;
     let citations: PolicyCitation[] = [];
     const toolTrace: ToolTraceEntry[] = [];
+    let usedTools = false;
     const finish = (reply: string): ChatTurnResult => ({
       reply: reservationNotice ?? policyReply ?? reply,
       citations,
@@ -254,7 +273,15 @@ export class ChatService {
     });
 
     for (let round = 0; round < 5; round += 1) {
-      const message = await this.complete(messages, true, deadline);
+      let message: LlmMessage;
+      try {
+        message = await this.complete(messages, true, deadline);
+      } catch (error) {
+        if (error instanceof LlmKeyRejectedException && usedTools) {
+          throw new LlmUnavailableException();
+        }
+        throw error;
+      }
       const toolCalls = message.tool_calls ?? [];
       if (toolCalls.length === 0) {
         return finish(message.content ?? '');
@@ -266,6 +293,7 @@ export class ChatService {
         tool_calls: toolCalls,
       });
 
+      usedTools = true;
       for (const call of toolCalls) {
         const outcome = await this.executeTool(call, dto.context, deadline, userId);
         toolTrace.push({
@@ -306,7 +334,15 @@ export class ChatService {
       }
     }
 
-    const finalMessage = await this.complete(messages, false, deadline);
+    let finalMessage: LlmMessage;
+    try {
+      finalMessage = await this.complete(messages, false, deadline);
+    } catch (error) {
+      if (error instanceof LlmKeyRejectedException && usedTools) {
+        throw new LlmUnavailableException();
+      }
+      throw error;
+    }
     return finish(finalMessage.content ?? '');
   }
 
@@ -352,6 +388,9 @@ export class ChatService {
       throw new LlmUnavailableException();
     }
 
+    if (response.status === 401 || response.status === 403) {
+      throw new LlmKeyRejectedException();
+    }
     if (!response.ok) {
       throw new LlmUnavailableException();
     }
@@ -751,6 +790,93 @@ export class ChatService {
     }
   }
 
+  private async ruleTurn(dto: ChatTurnDto, userId: string): Promise<ChatTurnResult> {
+    const deadline = Date.now() + CHAT_BUDGET_MS;
+    const steps = planRuleSteps(dto.message, dto.context);
+    let vehicles: ChatVehicle[] = [];
+    let reservation: ReservationView | null = null;
+    let reservationNotice: string | null = null;
+    let policyReply: string | null = null;
+    let citations: PolicyCitation[] = [];
+    const toolTrace: ToolTraceEntry[] = [];
+    let reply =
+      'I can search for a vehicle near you, describe the closest one, check whether it is free, price it, reserve it, or answer from the rental guide.';
+
+    for (const step of steps) {
+      let args = step.arguments;
+      if (
+        step.name === 'get_vehicle_details' &&
+        typeof args.vehicleId !== 'string' &&
+        vehicles.length === 0 &&
+        toolTrace.some((entry) => entry.name === 'search_vehicles')
+      ) {
+        continue;
+      }
+      if (
+        step.name === 'get_vehicle_details' &&
+        typeof args.vehicleId !== 'string' &&
+        vehicles.length > 0
+      ) {
+        const closest = [...vehicles].sort((left, right) => {
+          if (left.distanceKm !== right.distanceKm) {
+            return left.distanceKm - right.distanceKm;
+          }
+          return left.id.localeCompare(right.id);
+        })[0];
+        args = { vehicleId: closest.id };
+      }
+      const outcome = await this.executeTool(
+        {
+          id: `rule_${toolTrace.length + 1}`,
+          type: 'function',
+          function: {
+            name: step.name,
+            arguments: JSON.stringify(args),
+          },
+        },
+        dto.context,
+        deadline,
+        userId,
+      );
+      toolTrace.push({
+        name: outcome.name,
+        arguments: outcome.arguments,
+        ok: outcome.ok,
+      });
+      if (outcome.name === 'search_vehicles') {
+        vehicles = outcome.ok ? outcome.vehicles : [];
+      }
+      if (outcome.name === 'create_reservation') {
+        if (outcome.ok && outcome.reservation) {
+          reservation = outcome.reservation;
+          reservationNotice = null;
+        } else if (reservation === null) {
+          reservation = null;
+          reservationNotice =
+            outcome.userMessage ?? 'That reservation could not be completed.';
+        }
+      }
+      if (outcome.policy) {
+        if (outcome.policy.grounded) {
+          policyReply = outcome.policy.answer;
+          citations = outcome.policy.citations;
+        } else {
+          policyReply = GUIDE_DOES_NOT_COVER;
+          citations = [];
+        }
+      }
+      reply = describeRuleOutcome(outcome);
+    }
+
+    return {
+      reply: reservationNotice ?? policyReply ?? reply,
+      citations,
+      vehicles,
+      reservation,
+      toolTrace,
+    };
+  }
+
   private vehicleToolError(
     name: string,
     vehicleId: string,
@@ -1143,4 +1269,158 @@ function joinRanked(
     return { ok: false };
   }
   return { ok: true, vehicles: vehicles.slice(0, 5) };
+}
+
+type RuleStep = { name: string; arguments: Record<string, unknown> };
+
+function planRuleSteps(message: string, context: ChatContextDto): RuleStep[] {
+  const text = message.trim();
+  const vehicleId = mentionedVehicleId(text);
+  const dates = mentionedDateArgs(text);
+  const idArgs = vehicleId ? { vehicleId } : {};
+
+  if (isPolicyQuestion(text)) {
+    return [{ name: 'search_rental_policy', arguments: { query: text } }];
+  }
+  if (/\breserve\b|\bbook\b/i.test(text)) {
+    return [{ name: 'create_reservation', arguments: { ...idArgs, ...dates } }];
+  }
+  if (/\bcost\b|\bprice\b|\bhow much\b/i.test(text)) {
+    return [{ name: 'calculate_rental_price', arguments: { ...idArgs, ...dates } }];
+  }
+  if (/\bfree\b|\bavailable\b|\bavailability\b/i.test(text)) {
+    return [{ name: 'check_availability', arguments: { ...idArgs, ...dates } }];
+  }
+  if (/\btell me more\b|\bmore about\b|\bdetails\b|\bclosest\b/i.test(text)) {
+    if (!vehicleId && !context.activeVehicleId) {
+      return [
+        { name: 'search_vehicles', arguments: searchRuleArgs(text) },
+        { name: 'get_vehicle_details', arguments: {} },
+      ];
+    }
+    return [{ name: 'get_vehicle_details', arguments: { ...idArgs } }];
+  }
+  if (isVehicleSearch(text)) {
+    return [{ name: 'search_vehicles', arguments: searchRuleArgs(text) }];
+  }
+  return [];
+}
+
+function isPolicyQuestion(text: string): boolean {
+  return /\bfuel\b|\blate\b|\bcancel|\binsurance\b|\bpolicy\b|\bsecurity deposit\b|\brental guide\b/i.test(
+    text,
+  );
+}
+
+function isVehicleSearch(text: string): boolean {
+  return /\bfind\b|\bnear\b|\bsuv\b|\bsedan\b|\bhatchback\b|\bmuv\b|\bautomatic\b|\bmanual\b|\bunder\b/i.test(
+    text,
+  );
+}
+
+function mentionedVehicleId(text: string): string | undefined {
+  const matches = [...text.matchAll(/\(([A-Za-z0-9_-]+)\)/g)];
+  const id = matches.at(-1)?.[1];
+  if (!id || !/[-0-9]/.test(id)) {
+    return undefined;
+  }
+  return id;
+}
+
+function mentionedDateArgs(text: string): Record<string, unknown> {
+  const found =
+    text.match(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z/g) ?? [];
+  if (found.length >= 2) {
+    return { startDate: found[0], endDate: found[1] };
+  }
+  if (/\btomorrow\b/i.test(text)) {
+    return tomorrowWindow();
+  }
+  return {};
+}
+
+function searchRuleArgs(text: string): Record<string, unknown> {
+  const args: Record<string, unknown> = { ...mentionedDateArgs(text) };
+  const type = text.match(/\b(suv|sedan|hatchback|muv)\b/i);
+  if (type) {
+    args.type = type[1].toLowerCase();
+  }
+  const transmission = text.match(/\b(automatic|manual)\b/i);
+  if (transmission) {
+    args.transmission = transmission[1].toLowerCase();
+  }
+  const price = text.match(
+    /(?:under|below|up to|maximum|max)\s*(?:inr|rs\.?|₹)?\s*([\d,]+)/i,
+  );
+  if (price) {
+    args.maxPricePerDay = Number(price[1].replace(/,/g, ''));
+  }
+  return args;
+}
+
+function describeRuleOutcome(outcome: ToolOutcome): string {
+  if (!outcome.ok) {
+    if (outcome.userMessage) {
+      return outcome.userMessage;
+    }
+    const error = outcome.modelPayload.error;
+    if (typeof error === 'string') {
+      return error;
+    }
+    if (outcome.name === 'search_rental_policy') {
+      return 'The rental guide is unavailable right now.';
+    }
+    return 'That request could not be completed.';
+  }
+  if (outcome.name === 'search_vehicles') {
+    if (outcome.vehicles.length === 0) {
+      return 'No vehicles match those filters.';
+    }
+    return outcome.vehicles
+      .map(
+        (vehicle) =>
+          `${vehicle.year} ${vehicle.make} ${vehicle.model}: ${vehicle.type}, ${vehicle.transmission}, INR ${vehicle.pricePerDay} per day, ${vehicle.distanceKm} km away.`,
+      )
+      .join('\n');
+  }
+  if (outcome.name === 'get_vehicle_details') {
+    const vehicle = outcome.modelPayload.vehicle;
+    if (!vehicle || typeof vehicle !== 'object') {
+      return 'That vehicle was not found.';
+    }
+    const row = vehicle as {
+      year?: unknown;
+      make?: unknown;
+      model?: unknown;
+      seats?: unknown;
+      fuel?: unknown;
+      securityDeposit?: unknown;
+      pricePerDay?: unknown;
+    };
+    return `${String(row.year)} ${String(row.make)} ${String(row.model)} has ${String(row.seats)} seats, ${String(row.fuel)} fuel, a security deposit of INR ${String(row.securityDeposit)}, and a price of INR ${String(row.pricePerDay)} per day.`;
+  }
+  if (outcome.name === 'check_availability') {
+    if (outcome.modelPayload.available === true) {
+      return 'It is free for those dates.';
+    }
+    const conflicts = outcome.modelPayload.conflicts;
+    if (Array.isArray(conflicts) && conflicts.length > 0) {
+      return `It is not free. Conflicting reservation: ${conflicts.join(', ')}.`;
+    }
+    return 'It is not free for those dates.';
+  }
+  if (outcome.name === 'calculate_rental_price') {
+    const price = outcome.modelPayload;
+    return `The total is INR ${String(price.totalPrice)} (${String(price.dayCount)} × INR ${String(price.pricePerDay)} per day). The security deposit of INR ${String(price.securityDeposit)} is not included.`;
+  }
+  if (outcome.name === 'create_reservation' && outcome.reservation) {
+    return `Reservation ${outcome.reservation.id} is ${outcome.reservation.status}.`;
+  }
+  if (outcome.policy?.grounded) {
+    return outcome.policy.answer;
+  }
+  if (outcome.policy) {
+    return GUIDE_DOES_NOT_COVER;
+  }
+  return 'That request could not be completed.';
 }

@@ -32,6 +32,12 @@ function config(): ConfigService {
   } as unknown as ConfigService;
 }
 
+function configWithoutKey(): ConfigService {
+  return {
+    get: (key: string) => (key === 'LLM_API_KEY' ? '' : secrets[key as keyof typeof secrets]),
+  } as unknown as ConfigService;
+}
+
 function row(
   partial: Partial<VehicleSearchResult> & { id: string },
 ): VehicleSearchResult & { anchorLat?: number; anchorLng?: number } {
@@ -435,6 +441,170 @@ describe('ChatService', () => {
     });
     expect(fetchMock).not.toHaveBeenCalled();
     expect(search).not.toHaveBeenCalled();
+  });
+
+  it('answers a demo search from rules when no model key is set', async () => {
+    const matches = [
+      row({ id: 'V2', model: 'Seltos', make: 'Kia', pricePerDay: 2600, distanceKm: 1.2 }),
+    ];
+    const search = vi.fn().mockResolvedValue(matches);
+    const calls: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        calls.push(String(url));
+        if (String(url).endsWith('/rank')) {
+          return {
+            ok: true,
+            json: async () => [
+              { id: 'V2', rankScore: 0.9, reason: 'Closest automatic SUV within the budget.' },
+            ],
+          };
+        }
+        throw new Error(`unexpected ${url}`);
+      }),
+    );
+    vi.spyOn(Date, 'now').mockReturnValue(new Date('2026-10-01T12:00:00.000Z').getTime());
+
+    const result = await new ChatService(
+      { search } as unknown as VehiclesService,
+      configWithoutKey(),
+    ).turn(turn(DEMO));
+
+    expect(calls.some((url) => url.includes('/chat/completions'))).toBe(false);
+    expect(search).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'suv',
+        transmission: 'automatic',
+        maxPricePerDay: 3000,
+        startDate: '2026-10-02T04:30:00.000Z',
+        endDate: '2026-10-03T04:30:00.000Z',
+      }),
+    );
+    expect(result.reply).toContain('Kia Seltos');
+    expect(result.reply).toContain('automatic');
+    expect(result.reply).toContain('INR 2600 per day');
+    expect(result.reply).toContain('1.2 km away');
+    expect(result.vehicles.map((vehicle) => vehicle.id)).toEqual(['V2']);
+    expect(result.toolTrace[0]).toMatchObject({ name: 'search_vehicles', ok: true });
+  });
+
+  it('uses rules when the provider rejects the key', async () => {
+    const search = vi.fn().mockResolvedValue([
+      row({ id: 'V2', model: 'Seltos', make: 'Kia', pricePerDay: 2600, distanceKm: 1.2 }),
+    ]);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        if (String(url).includes('/chat/completions')) {
+          return { ok: false, status: 401, json: async () => ({}) };
+        }
+        if (String(url).endsWith('/rank')) {
+          return {
+            ok: true,
+            json: async () => [{ id: 'V2', rankScore: 0.9, reason: 'Closest.' }],
+          };
+        }
+        throw new Error(`unexpected ${url}`);
+      }),
+    );
+
+    const result = await new ChatService(
+      { search } as unknown as VehiclesService,
+      config(),
+    ).turn(turn(DEMO));
+
+    expect(search).toHaveBeenCalled();
+    expect(result.reply).toContain('Kia Seltos');
+  });
+
+  it('does not run the rules after a rejected key follows a completed tool', async () => {
+    const search = vi.fn().mockResolvedValue([row({ id: 'V1' })]);
+    let llmCalls = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        if (String(url).includes('/chat/completions')) {
+          llmCalls += 1;
+          if (llmCalls === 1) {
+            return completion(null, [toolCall({ type: 'suv' })]);
+          }
+          return { ok: false, status: 401, json: async () => ({}) };
+        }
+        if (String(url).endsWith('/rank')) {
+          return {
+            ok: true,
+            json: async () => [{ id: 'V1', rankScore: 0.5, reason: 'Ranked.' }],
+          };
+        }
+        throw new Error(`unexpected ${url}`);
+      }),
+    );
+
+    await expect(
+      new ChatService({ search } as unknown as VehiclesService, config()).turn(turn(DEMO)),
+    ).rejects.toBeInstanceOf(LlmUnavailableException);
+    expect(search).toHaveBeenCalledTimes(1);
+  });
+
+  it('describes, prices, and reserves the active vehicle from rules', async () => {
+    const details = vi.fn().mockResolvedValue({
+      id: 'near-seltos',
+      year: 2023,
+      make: 'Kia',
+      model: 'Seltos',
+      seats: 5,
+      fuel: 'petrol',
+      securityDeposit: 5000,
+      pricePerDay: 2600,
+    });
+    const availability = vi.fn().mockResolvedValue({ available: true });
+    const price = vi.fn().mockResolvedValue({
+      dayCount: 1,
+      pricePerDay: 2600,
+      totalPrice: 2600,
+      securityDeposit: 5000,
+      currency: 'INR',
+    });
+    const create = vi.fn().mockResolvedValue({
+      id: 'res-1',
+      vehicleId: 'near-seltos',
+      year: 2023,
+      make: 'Kia',
+      model: 'Seltos',
+      startAt: '2026-10-02T04:30:00.000Z',
+      endAt: '2026-10-03T04:30:00.000Z',
+      dayCount: 1,
+      pricePerDay: 2600,
+      totalPrice: 2600,
+      securityDeposit: 5000,
+      currency: 'INR',
+      status: 'confirmed',
+      createdAt: '2026-10-01T12:00:00.000Z',
+    });
+    const vehicles = { details, availability, price } as unknown as VehiclesService;
+    const reservations = { create } as unknown as ReservationsService;
+    const service = new ChatService(vehicles, configWithoutKey(), reservations);
+    const context = { activeVehicleId: 'near-seltos' };
+
+    const described = await service.turn(turn('Tell me more about the closest one.', context));
+    const free = await service.turn(turn('Is it free tomorrow?', context));
+    const cost = await service.turn(turn('What will it cost for tomorrow?', context));
+    const booked = await service.turn(turn('Reserve it for tomorrow.', context), 'priya-user');
+
+    expect(described.reply).toContain('2023 Kia Seltos has 5 seats, petrol fuel');
+    expect(described.reply).toContain('INR 5000');
+    expect(described.reply).toContain('INR 2600 per day');
+    expect(free.reply).toBe('It is free for those dates.');
+    expect(cost.reply).toBe(
+      'The total is INR 2600 (1 × INR 2600 per day). The security deposit of INR 5000 is not included.',
+    );
+    expect(booked.reply).toBe('Reservation res-1 is confirmed.');
+    expect(booked.reservation?.id).toBe('res-1');
+    expect(create).toHaveBeenCalledWith(
+      'priya-user',
+      expect.objectContaining({ vehicleId: 'near-seltos' }),
+    );
   });
 
   it('stops after five tool rounds and answers without tools', async () => {

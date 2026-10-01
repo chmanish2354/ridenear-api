@@ -50,7 +50,7 @@ Copy `.env.example` to `.env`. Set values locally. Do not commit `.env`.
 | `AI_SERVICE_URL` | AI service origin (no `/api` prefix) |
 | `AI_SERVICE_TOKEN` | Shared token sent to the AI service |
 | `LLM_BASE_URL` | OpenAI-compatible API origin |
-| `LLM_API_KEY` | Key for chat. Leave empty only if you are not running D2–D8 |
+| `LLM_API_KEY` | Optional. Empty, or a key the provider rejects, uses built-in rules for D2–D8. A key the provider accepts uses `gpt-4o-mini` |
 | `LLM_MODEL` | Must be `gpt-4o-mini` for the chat steps |
 | `CORS_ORIGIN` | Web origin allowed to call the API |
 | `GPS_TICK_MS` | Simulated GPS interval in milliseconds (default `2000`) |
@@ -58,7 +58,7 @@ Copy `.env.example` to `.env`. Set values locally. Do not commit `.env`.
 
 ## Local run
 
-1. Copy `.env.example` to `.env`. Set `AI_SERVICE_URL` to `http://localhost:8000`. Set `LLM_API_KEY` if you will run the chat steps.
+1. Copy `.env.example` to `.env`. Set `AI_SERVICE_URL` to `http://localhost:8000`. Leave `LLM_API_KEY` empty to run chat with built-in rules, or set a real key to use `gpt-4o-mini`.
 2. Start the AI service first. Follow [../ridenear-ai/README.md](../ridenear-ai/README.md).
 3. Start Postgres: `docker compose up -d postgres` from this directory.
 4. `npm install`
