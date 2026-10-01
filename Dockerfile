@@ -1,7 +1,7 @@
 FROM node:20.19-bookworm-slim AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN npm ci
+RUN npm install
 COPY prisma ./prisma
 COPY prisma.config.ts ./
 COPY tsconfig.json tsconfig.build.json nest-cli.json ./
@@ -13,7 +13,7 @@ FROM node:20.19-bookworm-slim AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+RUN npm install --omit=dev
 COPY prisma ./prisma
 COPY prisma.config.ts ./
 COPY --from=build /app/node_modules/.prisma ./node_modules/.prisma
