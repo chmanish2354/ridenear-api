@@ -33,9 +33,9 @@ async function bootstrap() {
   const document = SwaggerModule.createDocument(app, swaggerConfig);
   SwaggerModule.setup('api/docs', app, document);
 
-  const port = config.get<number>('PORT') ?? 3000;
+  const port = Number(process.env.PORT) || 3000;
   app.get(RealtimeService).attach(app.getHttpServer());
-  await app.listen(port);
+  await app.listen(port, '0.0.0.0');
 }
 
 await bootstrap();
